@@ -300,4 +300,5 @@ if __name__ == '__main__':
     if mode == 'train':
         main()
     elif mode == 'test':
-        predict(eval(sys.argv[2]))
+        epoch = eval(sys.argv[2])
+        predict(epoch)

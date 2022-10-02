@@ -2,6 +2,7 @@ import re
 import os
 import javalang
 import json
+from tqdm.contrib import tzip
 
 def is_identifier(token):
     if re.match(r'\w+', token) and not re.match(r'\d+', token):
@@ -70,7 +71,7 @@ def slicing_mask(front, back):
         assignment_flag = False
         depend = False
         for i, token in enumerate(st[0]):
-            if token is '=':
+            if token == '=':
                 flag = True
 
             if is_identifier(token) and not flag and token in seeds:
@@ -98,23 +99,21 @@ def slicing_mask(front, back):
     return ' '.join(front), ' '.join(back), mask
 
 def mask_slicing(dataset):
+    print(dataset)
     origin_root = 'data/baseline/'
-    with open(origin_root+'src-%s.txt'%dataset) as fps, open(origin_root+'tgt-%s.txt'%dataset) as fpt:
+    with open(f'{origin_root}src-{dataset}.txt') as fps, open(f'{origin_root}tgt-{dataset}.txt') as fpt:
         origin_src = fps.readlines()
         origin_tgt = fpt.readlines()
 
     target_root = 'data/multi_slicing/'
     os.makedirs(target_root, exist_ok=True)
-    with open(target_root+'src-%s.front'%dataset, 'w') as fwf, open(target_root+'src-%s.back'%dataset, 'w') as fwb,\
-            open(target_root+'src-%s.mask'%dataset, 'w') as fwm, \
-            open(target_root+'tgt-%s.txt'%dataset, 'w') as fwt:
-        for i, (s, t) in enumerate(zip(origin_src, origin_tgt)):
-            print(i)
+    with open(f'{target_root}src-{dataset}.front', 'w') as fwf, open(f'{target_root}src-{dataset}.back', 'w') as fwb,\
+            open(f'{target_root}src-{dataset}.mask', 'w') as fwm, \
+            open(f'{target_root}tgt-{dataset}.txt', 'w') as fwt:
+        for _, (s, t) in enumerate(tzip(origin_src, origin_tgt)):
             s = s.strip()
             if not re.match(r'\w+', s):
-                print(s)
                 s = re.sub(r'^.*?(\w+)', r' \1', s)
-                print(s)
             s = re.sub(r'\\\\', ' ', s)
             s = re.sub(r'\\ "', ' \\"', s)
             try_idx = get_try_index(s)
