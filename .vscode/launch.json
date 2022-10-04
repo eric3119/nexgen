@@ -1,0 +1,116 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python: task1",
+            "type": "python",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "cwd": "${workspaceRoot}/task1"
+        },
+        {
+            "name": "Python: task2",
+            "type": "python",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "cwd": "${workspaceRoot}/task2"
+        },
+        {
+            "name": "Python: tokenizer",
+            "type": "python",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "cwd": "${workspaceRoot}",
+            "args": ["task2"]
+        },
+        {
+            "name": "task2 preprocess",
+            "type": "python",
+            "request": "launch",
+            "program": "preprocess.py",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "cwd": "${workspaceRoot}/task2",
+            "args": [
+                "-train_src",            "data/multi_slicing/src-train.front",
+                "-train_ref",            "data/multi_slicing/src-train.back",
+                "-train_tgt",            "data/multi_slicing/tgt-train.txt",
+                "-valid_src",            "data/multi_slicing/src-valid.front",
+                "-valid_ref",            "data/multi_slicing/src-valid.back",
+                "-valid_tgt",            "data/multi_slicing/tgt-valid.txt",
+                "-save_data",            "data/multi_slicing/multi_encoder",
+                "-src_seq_length",       "10000",
+                "-ref_seq_length",       "10000",
+                "-tgt_seq_length",       "10000",
+                "-src_seq_length_trunc", "400",
+                "-ref_seq_length_trunc", "400",
+                "-tgt_seq_length_trunc", "100",
+            ]
+        },
+        {
+            "name": "(non-GPU) task2 train",
+            "type": "python",
+            "request": "launch",
+            "program": "train.py",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "cwd": "${workspaceRoot}/task2",
+            "args": [
+                "-save_model",       "models/multi_slicing/multi_encoder",
+                "-mask_attention",
+                "-mask_path",        "data/multi_slicing/src-train.mask:data/multi_slicing/src-valid.mask",
+                "-refer",
+                "-data",             "data/multi_slicing/multi_encoder",
+                "-global_attention", "mlp",
+                "-word_vec_size",    "128",
+                "-rnn_size",         "128",
+                "-layers",           "1",
+                "-encoder_type",     "brnn",
+                // "-train_steps",      "100000",
+                "-train_steps",      "5000",
+                "-max_grad_norm",    "2",
+                "-dropout",          "0.",
+                "-batch_size",       "32",
+                "-valid_batch_size", "32",
+                "-optim",            "adam",
+                "-learning_rate",    "0.001",
+                "-bridge",
+                "-log_file",         "models/multi_slicing.log",
+                "-world_size",       "1",
+                // "-gpu_ranks",        "0",
+            ]
+        },
+        {
+            "name": "(non-GPU) task2 infer",
+            "type": "python",
+            "request": "launch",
+            "program": "translate.py",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "cwd": "${workspaceRoot}/task2",
+            "args": [
+                // "-gpu",       "0",
+                "-batch_size", "32",
+                "-beam_size",  "5",
+                "-min_length", "3",
+                "-mask_attention",
+                "-mask_path",   "data/multi_slicing/src-test.mask",
+                // "-model",       "models/multi_slicing/multi_encoder_step_100000.pt",
+                "-model",       "models/multi_slicing/multi_encoder_step_5000.pt",
+                "-src",         "data/multi_slicing/src-test.front",
+                "-refer",
+                "-ref_path",    "data/multi_slicing/src-test.back",
+                "-output",      "testout/multi_slicing.out",
+            ]
+        },
+    ]
+}

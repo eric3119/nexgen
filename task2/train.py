@@ -117,4 +117,6 @@ if __name__ == "__main__":
     opts.train_opts(parser)
 
     opt = parser.parse_args()
+
+    os.makedirs("models", exist_ok=True)
     main(opt)
