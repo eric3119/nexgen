@@ -1,13 +1,18 @@
 import re
 import os
-import javalang
+# import javalang
+import token as pytoken
+import keyword
 import json
 from tqdm.contrib import tzip
 
+INDENT_STR = pytoken.tok_name[pytoken.INDENT]
+DEDENT_STR = pytoken.tok_name[pytoken.DEDENT]
+NEWLINE_STR = pytoken.tok_name[pytoken.NEWLINE]
+
 def is_identifier(token):
     if re.match(r'\w+', token) and not re.match(r'\d+', token):
-        if token not in javalang.tokenizer.Keyword.VALUES.union(javalang.tokenizer.BasicType.VALUES)\
-                .union(javalang.tokenizer.Modifier.VALUES):
+        if token not in keyword.kwlist:
             return True
     return False
 
@@ -41,7 +46,7 @@ def get_statements(code):
             continue
 
         if not stack:
-            if token in ['{', '}', ';'] and not flag:
+            if token in [INDENT_STR, DEDENT_STR, NEWLINE_STR] and not flag:
                 intervals.append((start, i))
                 start = i+1
             elif token == '(':
@@ -57,6 +62,7 @@ def slicing_mask(front, back):
     tokens = back
     seeds = set()
     for i, token in enumerate(tokens):
+        if token in [INDENT_STR, DEDENT_STR, NEWLINE_STR]: continue
         if is_identifier(token):
             if tokens[i+1] != '(' and not is_identifier(tokens[i+1]):
                 seeds.add(token)

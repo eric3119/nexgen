@@ -1,5 +1,6 @@
 venv
 task1/data
+task1/checkpoints
 task1/java_data
 task1/output
 task1/java_output
