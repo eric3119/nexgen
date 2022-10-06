@@ -98,11 +98,11 @@ a, b, c = int((len(index_rnd)/4) * 1), int((len(index_rnd)/4) * 2), int((len(ind
 
 pd.DataFrame(
         [functions_list[i] for i in index_rnd[:a]]
-    ).to_pickle('task1/data/train.pkl')
+    ).to_pickle('task1/data/train.pkl', protocol=4)
 pd.DataFrame(
         [functions_list[i] for i in index_rnd[a:b]]
-    ).to_pickle('task1/data/test.pkl')
+    ).to_pickle('task1/data/test.pkl', protocol=4)
 pd.DataFrame(
         [functions_list[i] for i in index_rnd[b:]]
-    ).to_pickle('task1/data/valid.pkl')
+    ).to_pickle('task1/data/valid.pkl', protocol=4)
 
