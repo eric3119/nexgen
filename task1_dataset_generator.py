@@ -1,6 +1,10 @@
 import token as pytoken
 import tokenize
+
 import pandas as pd
+from numpy.random import default_rng
+
+rng = default_rng()
 
 functions_list = []
 python_file = 'task1/data/teste.py'
@@ -82,12 +86,23 @@ with open(python_file) as f:
         if indent_start_function_def is not None and not ignore_line:
             token_buffer.append(token_info.string)
 
-for fs in functions_list: 
-    for fdef in (zip(fs['labels'], fs['lines'])):
-        print(fdef)
-    print()
+# debug print
+# for fs in functions_list: 
+#     for fdef in (zip(fs['labels'], fs['lines'])):
+#         print(fdef)
+#     print()
 
-# df = pd.DataFrame(functions_list)
-# df.to_pickle('task1/data/train.pkl')
-# df.to_pickle('task1/data/test.pkl')
-# df.to_pickle('task1/data/valid.pkl')
+# split dataset
+index_rnd = rng.choice(len(functions_list), size=len(functions_list), replace=False)
+a, b, c = int((len(index_rnd)/4) * 1), int((len(index_rnd)/4) * 2), int((len(index_rnd)/4) * 3)
+
+pd.DataFrame(
+        [functions_list[i] for i in index_rnd[:a]]
+    ).to_pickle('task1/data/train.pkl')
+pd.DataFrame(
+        [functions_list[i] for i in index_rnd[a:b]]
+    ).to_pickle('task1/data/test.pkl')
+pd.DataFrame(
+        [functions_list[i] for i in index_rnd[b:]]
+    ).to_pickle('task1/data/valid.pkl')
+
