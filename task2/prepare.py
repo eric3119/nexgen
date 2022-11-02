@@ -6,9 +6,10 @@ import keyword
 import json
 from tqdm.contrib import tzip
 
-INDENT_STR = pytoken.tok_name[pytoken.INDENT]
-DEDENT_STR = pytoken.tok_name[pytoken.DEDENT]
-NEWLINE_STR = pytoken.tok_name[pytoken.NEWLINE]
+INDENT_STR = f'<{pytoken.tok_name[pytoken.INDENT]}>'
+DEDENT_STR = f'<{pytoken.tok_name[pytoken.DEDENT]}>'
+NEWLINE_STR = f'<{pytoken.tok_name[pytoken.NEWLINE]}>'
+
 
 def is_identifier(token):
     if re.match(r'\w+', token) and not re.match(r'\d+', token):
@@ -16,11 +17,12 @@ def is_identifier(token):
             return True
     return False
 
+
 def get_try_index(code):
     start = 0
     stack = []
     for i, token in enumerate(code.split()):
-        if token == 'try' and not stack:
+        if token == 'try':  # and not stack:
             start = i
         elif token in ["'", '"']:
             if stack:
@@ -29,6 +31,7 @@ def get_try_index(code):
             else:
                 stack.append(token)
     return start
+
 
 def get_statements(code):
     tokens = code.split() if isinstance(code, str) else code
@@ -62,7 +65,8 @@ def slicing_mask(front, back):
     tokens = back
     seeds = set()
     for i, token in enumerate(tokens):
-        if token in [INDENT_STR, DEDENT_STR, NEWLINE_STR]: continue
+        if token in [INDENT_STR, DEDENT_STR, NEWLINE_STR]:
+            continue
         if is_identifier(token):
             if tokens[i+1] != '(' and not is_identifier(tokens[i+1]):
                 seeds.add(token)
@@ -104,6 +108,7 @@ def slicing_mask(front, back):
 
     return ' '.join(front), ' '.join(back), mask
 
+
 def mask_slicing(dataset):
     print(dataset)
     origin_root = 'data/baseline/'
@@ -113,10 +118,11 @@ def mask_slicing(dataset):
 
     target_root = 'data/multi_slicing/'
     os.makedirs(target_root, exist_ok=True)
-    with open(f'{target_root}src-{dataset}.front', 'w') as fwf, open(f'{target_root}src-{dataset}.back', 'w') as fwb,\
-            open(f'{target_root}src-{dataset}.mask', 'w') as fwm, \
-            open(f'{target_root}tgt-{dataset}.txt', 'w') as fwt:
-        for _, (s, t) in enumerate(tzip(origin_src, origin_tgt)):
+    with open(f'{target_root}src-{dataset}.front', 'w') as file_write_front, \
+            open(f'{target_root}src-{dataset}.back', 'w') as file_write_back, \
+            open(f'{target_root}src-{dataset}.mask', 'w') as file_write_mask, \
+            open(f'{target_root}tgt-{dataset}.txt', 'w') as file_write_target:
+        for s, t in tzip(origin_src, origin_tgt):
             s = s.strip()
             if not re.match(r'\w+', s):
                 s = re.sub(r'^.*?(\w+)', r' \1', s)
@@ -131,11 +137,13 @@ def mask_slicing(dataset):
             back = s[try_idx:]
             front, back, mask = slicing_mask(front, back)
             mask = json.dumps(mask)
-            fwf.write(front+'\n')
-            fwb.write(back+'\n')
-            fwm.write(mask+'\n')
-            fwt.write(t)
+            file_write_front.write(front+'\n')
+            file_write_back.write(back+'\n')
+            file_write_mask.write(mask+'\n')
+            file_write_target.write(t)
 
-mask_slicing('train')
-mask_slicing('valid')
-mask_slicing('test')
+
+if __name__ == '__main__':
+    mask_slicing('train')
+    mask_slicing('valid')
+    mask_slicing('test')
