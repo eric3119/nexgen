@@ -1,170 +1,246 @@
 #!/usr/bin/env python
-"""
-    Training on a single process
-"""
-
-import configargparse
-
-import os
-import random
+"""Training on a single process."""
 import torch
+import sys
 
-import onmt.opts as opts
-
-from onmt.inputters.inputter import build_dataset_iter, lazily_load_dataset, \
-    _load_fields, _collect_report_features
+from onmt.utils.logging import init_logger, logger
+from onmt.utils.parse import ArgumentParser
+from onmt.constants import CorpusTask
+from onmt.transforms import (
+    make_transforms,
+    save_transforms,
+    get_specials,
+    get_transforms_cls,
+)
+from onmt.inputters import build_vocab
+from onmt.inputters.inputter import dict_to_vocabs, vocabs_to_dict
+from onmt.inputters.dynamic_iterator import build_dynamic_dataset_iter
+from onmt.inputters.text_corpus import save_transformed_sample
 from onmt.model_builder import build_model
-from onmt.utils.optimizers import build_optim
+from onmt.models.model_saver import load_checkpoint
+from onmt.utils.optimizers import Optimizer
+from onmt.utils.misc import set_random_seed
 from onmt.trainer import build_trainer
 from onmt.models import build_model_saver
-from onmt.utils.logging import init_logger, logger
+from onmt.modules.embeddings import prepare_pretrained_embeddings
 
 
-def _check_save_model_path(opt):
-    save_model_path = os.path.abspath(opt.save_model)
-    model_dirname = os.path.dirname(save_model_path)
-    if not os.path.exists(model_dirname):
-        os.makedirs(model_dirname)
+def prepare_transforms_vocabs(opt, transforms_cls):
+    """Prepare or dump transforms before training."""
+    # if transform + options set in 'valid' we need to copy in main
+    # transform / options for scoring considered as inference
+    validset_transforms = opt.data.get("valid", {}).get("transforms", None)
+    if validset_transforms:
+        opt.transforms = validset_transforms
+        if opt.data.get("valid", {}).get("tgt_prefix", None):
+            opt.tgt_prefix = opt.data.get("valid", {}).get("tgt_prefix", None)
+        if opt.data.get("valid", {}).get("src_prefix", None):
+            opt.src_prefix = opt.data.get("valid", {}).get("src_prefix", None)
+        if opt.data.get("valid", {}).get("tgt_suffix", None):
+            opt.tgt_suffix = opt.data.get("valid", {}).get("tgt_suffix", None)
+        if opt.data.get("valid", {}).get("src_suffix", None):
+            opt.src_suffix = opt.data.get("valid", {}).get("src_suffix", None)
+    specials = get_specials(opt, transforms_cls)
+
+    vocabs = build_vocab(opt, specials)
+
+    # maybe prepare pretrained embeddings, if any
+    prepare_pretrained_embeddings(opt, vocabs)
+
+    if opt.dump_transforms or opt.n_sample != 0:
+        transforms = make_transforms(opt, transforms_cls, vocabs)
+    if opt.dump_transforms:
+        save_transforms(transforms, opt.save_data, overwrite=opt.overwrite)
+    if opt.n_sample != 0:
+        logger.warning(
+            "`-n_sample` != 0: Training will not be started. "
+            f"Stop after saving {opt.n_sample} samples/corpus."
+        )
+        save_transformed_sample(opt, transforms, n_sample=opt.n_sample)
+        logger.info("Sample saved, please check it before restart training.")
+        sys.exit()
+    logger.info(
+        "The first 10 tokens of the vocabs are:"
+        f"{vocabs_to_dict(vocabs)['src'][0:10]}"
+    )
+    logger.info(f"The decoder start token is: {opt.decoder_start_token}")
+    return vocabs
 
 
-def _tally_parameters(model):
-    n_params = sum([p.nelement() for p in model.parameters()])
-    enc = 0
-    dec = 0
-    for name, param in model.named_parameters():
-        if 'encoder' in name:
-            enc += param.nelement()
-        elif 'decoder' or 'generator' in name:
-            dec += param.nelement()
-    return n_params, enc, dec
+def _init_train(opt):
+    """Common initilization stuff for all training process.
+    We need to build or rebuild the vocab in 3 cases:
+    - training from scratch (train_from is false)
+    - resume training but transforms have changed
+    - resume training but vocab file has been modified
+    """
+    ArgumentParser.validate_prepare_opts(opt)
+    transforms_cls = get_transforms_cls(opt._all_transform)
+    if opt.train_from:
+        # Load checkpoint if we resume from a previous training.
+        checkpoint = load_checkpoint(ckpt_path=opt.train_from)
+        vocabs = dict_to_vocabs(checkpoint["vocab"])
+        if (
+            hasattr(checkpoint["opt"], "_all_transform")
+            and len(
+                opt._all_transform.symmetric_difference(
+                    checkpoint["opt"]._all_transform
+                )
+            )
+            != 0
+        ):
+            _msg = "configured transforms is different from checkpoint:"
+            new_transf = opt._all_transform.difference(checkpoint["opt"]._all_transform)
+            old_transf = checkpoint["opt"]._all_transform.difference(opt._all_transform)
+            if len(new_transf) != 0:
+                _msg += f" +{new_transf}"
+            if len(old_transf) != 0:
+                _msg += f" -{old_transf}."
+            logger.warning(_msg)
+            vocabs = prepare_transforms_vocabs(opt, transforms_cls)
+        if opt.update_vocab:
+            logger.info("Updating checkpoint vocabulary with new vocabulary")
+            vocabs = prepare_transforms_vocabs(opt, transforms_cls)
+    else:
+        checkpoint = None
+        vocabs = prepare_transforms_vocabs(opt, transforms_cls)
+
+    return checkpoint, vocabs, transforms_cls
 
 
-def training_opt_postprocessing(opt, device_id):
-    if opt.word_vec_size != -1:
-        opt.src_word_vec_size = opt.word_vec_size
-        opt.tgt_word_vec_size = opt.word_vec_size
-
-    if opt.layers != -1:
-        opt.enc_layers = opt.layers
-        opt.dec_layers = opt.layers
-
-    if opt.rnn_size != -1:
-        opt.enc_rnn_size = opt.rnn_size
-        opt.dec_rnn_size = opt.rnn_size
-        if opt.model_type == 'text' and opt.enc_rnn_size != opt.dec_rnn_size:
-            raise AssertionError("""We do not support different encoder and
-                                 decoder rnn sizes for translation now.""")
-
-    opt.brnn = (opt.encoder_type == "brnn")
-
-    if opt.rnn_type == "SRU" and not opt.gpu_ranks:
-        raise AssertionError("Using SRU requires -gpu_ranks set.")
-
-    if torch.cuda.is_available() and not opt.gpu_ranks:
-        logger.info("WARNING: You have a CUDA device, \
-                    should run with -gpu_ranks")
-
-    if opt.seed > 0:
-        torch.manual_seed(opt.seed)
-        # this one is needed for torchtext random call (shuffled iterator)
-        # in multi gpu it ensures datasets are read in the same order
-        random.seed(opt.seed)
-        # some cudnn methods can be random even after fixing the seed
-        # unless you tell it to be deterministic
-        torch.backends.cudnn.deterministic = True
-
+def configure_process(opt, device_id):
     if device_id >= 0:
         torch.cuda.set_device(device_id)
-        if opt.seed > 0:
-            # These ensure same initialization in multi gpu mode
-            torch.cuda.manual_seed(opt.seed)
+    set_random_seed(opt.seed, device_id >= 0)
 
-    return opt
+
+def _get_model_opts(opt, checkpoint=None):
+    """Get `model_opt` to build model, may load from `checkpoint` if any."""
+    if checkpoint is not None:
+        model_opt = ArgumentParser.ckpt_model_opts(checkpoint["opt"])
+        if opt.override_opts:
+            logger.info("Over-ride model option set to true - use with care")
+            args = list(opt.__dict__.keys())
+            model_args = list(model_opt.__dict__.keys())
+            for arg in args:
+                if arg in model_args and getattr(opt, arg) != getattr(model_opt, arg):
+                    logger.info(
+                        "Option: %s , value: %s overriding model: %s"
+                        % (arg, getattr(opt, arg), getattr(model_opt, arg))
+                    )
+            model_opt = opt
+        else:
+            model_opt = ArgumentParser.ckpt_model_opts(checkpoint["opt"])
+            ArgumentParser.update_model_opts(model_opt)
+            ArgumentParser.validate_model_opts(model_opt)
+            if opt.tensorboard_log_dir == model_opt.tensorboard_log_dir and hasattr(
+                model_opt, "tensorboard_log_dir_dated"
+            ):
+                # ensure tensorboard output is written in the directory
+                # of previous checkpoints
+                opt.tensorboard_log_dir_dated = (
+                    model_opt.tensorboard_log_dir_dated
+                )  # noqa: E501
+            # Override checkpoint's update_embeddings as it defaults to false
+            model_opt.update_vocab = opt.update_vocab
+            # Override checkpoint's freezing settings as it defaults to false
+            model_opt.freeze_encoder = opt.freeze_encoder
+            model_opt.freeze_decoder = opt.freeze_decoder
+    else:
+        model_opt = opt
+    return model_opt
 
 
 def main(opt, device_id):
-    opt = training_opt_postprocessing(opt, device_id)
+    """Start training on `device_id`."""
+    # NOTE: It's important that ``opt`` has been validated and updated
+    # at this point.
+
+    configure_process(opt, device_id)
     init_logger(opt.log_file)
-    # Load checkpoint if we resume from a previous training.
-    if opt.train_from:
-        logger.info('Loading checkpoint from %s' % opt.train_from)
-        checkpoint = torch.load(opt.train_from,
-                                map_location=lambda storage, loc: storage)
-
-        # Load default opts values then overwrite it with opts from
-        # the checkpoint. It's usefull in order to re-train a model
-        # after adding a new option (not set in checkpoint)
-        dummy_parser = configargparse.ArgumentParser()
-        opts.model_opts(dummy_parser)
-        default_opt = dummy_parser.parse_known_args([])[0]
-
-        model_opt = default_opt
-        model_opt.__dict__.update(checkpoint['opt'].__dict__)
-    else:
-        checkpoint = None
-        model_opt = opt
-
-    # Peek the first dataset to determine the data_type.
-    # (All datasets have the same data_type).
-    first_dataset = next(lazily_load_dataset("train", opt))
-    data_type = first_dataset.data_type
-
-    # Load fields generated from preprocess phase.
-    fields = _load_fields(first_dataset, data_type, opt, checkpoint)
-
-    # Report src/tgt features.
-
-    src_features, tgt_features = _collect_report_features(fields)
-    for j, feat in enumerate(src_features):
-        logger.info(' * src feature %d size = %d'
-                    % (j, len(fields[feat].vocab)))
-    for j, feat in enumerate(tgt_features):
-        logger.info(' * tgt feature %d size = %d'
-                    % (j, len(fields[feat].vocab)))
+    checkpoint, vocabs, transforms_cls = _init_train(opt)
+    model_opt = _get_model_opts(opt, checkpoint=checkpoint)
 
     # Build model.
-    model = build_model(model_opt, opt, fields, checkpoint)
-    n_params, enc, dec = _tally_parameters(model)
-    logger.info('encoder: %d' % enc)
-    logger.info('decoder: %d' % dec)
-    logger.info('* number of parameters: %d' % n_params)
-    _check_save_model_path(opt)
+    model = build_model(model_opt, opt, vocabs, checkpoint, device_id)
+
+    model.count_parameters(log=logger.info)
+    trainable = {
+        "torch.float32": 0,
+        "torch.float16": 0,
+        "torch.uint8": 0,
+        "torch.int8": 0,
+    }
+    non_trainable = {
+        "torch.float32": 0,
+        "torch.float16": 0,
+        "torch.uint8": 0,
+        "torch.int8": 0,
+    }
+    for n, p in model.named_parameters():
+        if p.requires_grad:
+            trainable[str(p.dtype)] += p.numel()
+        else:
+            non_trainable[str(p.dtype)] += p.numel()
+    logger.info("Trainable parameters = %s" % str(trainable))
+    logger.info("Non trainable parameters = %s" % str(non_trainable))
+    logger.info(" * src vocab size = %d" % len(vocabs["src"]))
+    logger.info(" * tgt vocab size = %d" % len(vocabs["tgt"]))
+    if "src_feats" in vocabs:
+        for i, feat_vocab in enumerate(vocabs["src_feats"]):
+            logger.info(f"* src_feat {i} vocab size = {len(feat_vocab)}")
 
     # Build optimizer.
-    optim = build_optim(model, opt, checkpoint)
+    optim = Optimizer.from_opt(model, opt, checkpoint=checkpoint)
+
+    del checkpoint
 
     # Build model saver
-    model_saver = build_model_saver(model_opt, opt, model, fields, optim)
+    model_saver = build_model_saver(model_opt, opt, model, vocabs, optim, device_id)
 
-    trainer = build_trainer(opt, device_id, model, fields,
-                            optim, data_type, model_saver=model_saver)
+    trainer = build_trainer(
+        opt, device_id, model, vocabs, optim, model_saver=model_saver
+    )
 
-    def train_iter_fct(): return build_dataset_iter(
-        lazily_load_dataset("train", opt), fields, opt)
+    offset = max(0, device_id) if opt.parallel_mode == "data_parallel" else 0
+    stride = max(1, len(opt.gpu_ranks)) if opt.parallel_mode == "data_parallel" else 1
 
-    def valid_iter_fct(): return build_dataset_iter(
-        lazily_load_dataset("valid", opt), fields, opt, is_train=False)
+    train_iter = build_dynamic_dataset_iter(
+        opt,
+        transforms_cls,
+        vocabs,
+        task=CorpusTask.TRAIN,
+        copy=opt.copy_attn,
+        stride=stride,
+        offset=offset,
+        device_id=device_id,
+    )
 
-    # Do training.
+    valid_iter = build_dynamic_dataset_iter(
+        opt,
+        transforms_cls,
+        vocabs,
+        task=CorpusTask.VALID,
+        copy=opt.copy_attn,
+        device_id=device_id,
+    )
+
     if len(opt.gpu_ranks):
-        logger.info('Starting training on GPU: %s' % opt.gpu_ranks)
+        logger.info("Starting training on GPU: %s" % opt.gpu_ranks)
     else:
-        logger.info('Starting training on CPU, could be very slow')
-    trainer.train(train_iter_fct, valid_iter_fct, opt.train_steps,
-                  opt.valid_steps)
+        logger.info("Starting training on CPU, could be very slow")
+    train_steps = opt.train_steps
+    if opt.single_pass and train_steps > 0:
+        logger.warning("Option single_pass is enabled, ignoring train_steps.")
+        train_steps = 0
 
-    if opt.tensorboard:
+    trainer.train(
+        train_iter,
+        train_steps,
+        save_checkpoint_steps=opt.save_checkpoint_steps,
+        valid_iter=valid_iter,
+        valid_steps=opt.valid_steps,
+    )
+
+    if trainer.report_manager.tensorboard_writer is not None:
         trainer.report_manager.tensorboard_writer.close()
-
-
-if __name__ == "__main__":
-    parser = configargparse.ArgumentParser(
-        description='train.py',
-        formatter_class=configargparse.ArgumentDefaultsHelpFormatter)
-
-    opts.add_md_help_argument(parser)
-    opts.model_opts(parser)
-    opts.train_opts(parser)
-
-    opt = parser.parse_args()
-    main(opt)

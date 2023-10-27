@@ -2,51 +2,35 @@
 
 import torch.nn as nn
 
-from onmt.utils.misc import aeq
-
 
 class EncoderBase(nn.Module):
     """
     Base encoder class. Specifies the interface used by different encoder types
-    and required by :obj:`onmt.Models.NMTModel`.
+    and required by :class:`onmt.Models.NMTModel`.
 
-    .. mermaid::
-
-       graph BT
-          A[Input]
-          subgraph RNN
-            C[Pos 1]
-            D[Pos 2]
-            E[Pos N]
-          end
-          F[Memory_Bank]
-          G[Final]
-          A-->C
-          A-->D
-          A-->E
-          C-->F
-          D-->F
-          E-->F
-          E-->G
     """
 
-    def _check_args(self, src, lengths=None, hidden=None):
-        _, n_batch, _ = src.size()
-        if lengths is not None:
-            n_batch_, = lengths.size()
-            aeq(n_batch, n_batch_)
+    @classmethod
+    def from_opt(cls, opt, embeddings=None):
+        raise NotImplementedError
 
-    def forward(self, src, lengths=None):
+    def forward(self, src, src_len=None):
         """
         Args:
-            src (:obj:`LongTensor`):
-               padded sequences of sparse indices `[src_len x batch x nfeat]`
-            lengths (:obj:`LongTensor`): length of each sequence `[batch]`
-
+            src (LongTensor):
+               padded sequences of sparse indices ``(batch, src_len, nfeat)``
+            src_len (LongTensor): length of each sequence ``(batch,)``
 
         Returns:
-            (tuple of :obj:`FloatTensor`, :obj:`FloatTensor`):
-                * final encoder state, used to initialize decoder
-                * memory bank for attention, `[src_len x batch x hidden]`
+            (FloatTensor, FloatTensor, FloatTensor):
+
+            * enc_out (encoder output used for attention),
+              ``(batch, src_len, hidden_size)``
+              for bidirectional rnn last dimension is 2x hidden_size
+            * enc_final_hs: encoder final hidden state
+              ``(num_layers x dir, batch, hidden_size)``
+              In the case of LSTM this is a tuple.
+            * src_len ``(batch)``
         """
+
         raise NotImplementedError

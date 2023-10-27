@@ -4,10 +4,16 @@ Implementation of "Attention is All You Need"
 
 import torch.nn as nn
 
-import onmt
 from onmt.encoders.encoder import EncoderBase
-# from onmt.utils.misc import aeq
+from onmt.modules import MultiHeadedAttention
 from onmt.modules.position_ffn import PositionwiseFeedForward
+from onmt.modules.position_ffn import ActivationFunction
+from onmt.utils.misc import sequence_mask
+
+try:
+    from apex.normalization import FusedRMSNorm as RMSNorm
+except ImportError:
+    from onmt.modules.rmsnorm import RMSNorm
 
 
 class TransformerEncoderLayer(nn.Module):
@@ -21,52 +27,102 @@ class TransformerEncoderLayer(nn.Module):
         heads (int): the number of head for MultiHeadedAttention.
         d_ff (int): the second-layer of the PositionwiseFeedForward.
         dropout (float): dropout probability(0-1.0).
+        pos_ffn_activation_fn (ActivationFunction):
+            activation function choice for PositionwiseFeedForward layer
     """
 
-    def __init__(self, d_model, heads, d_ff, dropout):
+    def __init__(
+        self,
+        d_model,
+        heads,
+        d_ff,
+        dropout,
+        attention_dropout,
+        max_relative_positions=0,
+        relative_positions_buckets=0,
+        pos_ffn_activation_fn=ActivationFunction.relu,
+        add_qkvbias=False,
+        num_kv=0,
+        add_ffnbias=True,
+        parallel_residual=False,
+        layer_norm="standard",
+        norm_eps=1e-6,
+        use_ckpting=[],
+        parallel_gpu=1,
+    ):
         super(TransformerEncoderLayer, self).__init__()
 
-        self.self_attn = onmt.modules.MultiHeadedAttention(
-            heads, d_model, dropout=dropout)
-        self.feed_forward = PositionwiseFeedForward(d_model, d_ff, dropout)
-        self.layer_norm = nn.LayerNorm(d_model, eps=1e-6)
+        self.self_attn = MultiHeadedAttention(
+            heads,
+            d_model,
+            dropout=attention_dropout,
+            is_decoder=False,
+            max_relative_positions=max_relative_positions,
+            relative_positions_buckets=relative_positions_buckets,
+            attn_type="self",
+            add_qkvbias=add_qkvbias,
+            num_kv=num_kv,
+            use_ckpting=use_ckpting,
+            parallel_gpu=parallel_gpu,
+        )
+        self.feed_forward = PositionwiseFeedForward(
+            d_model,
+            d_ff,
+            dropout,
+            pos_ffn_activation_fn,
+            add_ffnbias,
+            parallel_residual,
+            layer_norm,
+            norm_eps,
+            use_ckpting=use_ckpting,
+            parallel_gpu=parallel_gpu,
+        )
+        self.parallel_residual = parallel_residual
+        if layer_norm == "standard":
+            self.layer_norm = nn.LayerNorm(d_model, eps=norm_eps)
+        elif layer_norm == "rms":
+            self.layer_norm = RMSNorm(d_model, eps=norm_eps)
+        else:
+            raise ValueError(f"{layer_norm} layer norm type is not supported")
+        self.dropout_p = dropout
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, inputs, mask):
+    def forward(self, layer_in, mask):
         """
-        Transformer Encoder Layer definition.
-
         Args:
-            inputs (`FloatTensor`): `[batch_size x src_len x model_dim]`
-            mask (`LongTensor`): `[batch_size x src_len x src_len]`
+            layer_in (FloatTensor): ``(batch_size, src_len, model_dim)``
+            mask (LongTensor): ``(batch_size, 1, src_len)``
 
         Returns:
-            (`FloatTensor`):
-
-            * outputs `[batch_size x src_len x model_dim]`
+            (FloatTensor):
+            * layer_out ``(batch_size, src_len, model_dim)``
         """
-        input_norm = self.layer_norm(inputs)
-        context, _ = self.self_attn(input_norm, input_norm, input_norm,
-                                    mask=mask)
-        out = self.dropout(context) + inputs
-        return self.feed_forward(out)
+        norm_layer_in = self.layer_norm(layer_in)
+        context, _ = self.self_attn(
+            norm_layer_in, norm_layer_in, norm_layer_in, mask=mask
+        )
+        if self.dropout_p > 0:
+            context = self.dropout(context)
+        if self.parallel_residual:
+            # feed_forward applies residual, so we remove and apply residual with un-normed
+            layer_out = (
+                self.feed_forward(norm_layer_in) - norm_layer_in + layer_in + context
+            )
+        else:
+            layer_out = context + layer_in
+            layer_out = self.feed_forward(layer_out)
+
+        return layer_out
+
+    def update_dropout(self, dropout, attention_dropout):
+        self.self_attn.update_dropout(attention_dropout)
+        self.feed_forward.update_dropout(dropout)
+        self.dropout.p = dropout
 
 
 class TransformerEncoder(EncoderBase):
-    """
-    The Transformer encoder from "Attention is All You Need".
-
-
-    .. mermaid::
-
-       graph BT
-          A[input]
-          B[multi-head self-attn]
-          C[feed forward]
-          O[output]
-          A --> B
-          B --> C
-          C --> O
+    """The Transformer encoder from "Attention is All You Need"
+    :cite:`DBLP:journals/corr/VaswaniSPUJGKP17`
 
     Args:
         num_layers (int): number of encoder layers
@@ -74,42 +130,116 @@ class TransformerEncoder(EncoderBase):
         heads (int): number of heads
         d_ff (int): size of the inner FF layer
         dropout (float): dropout parameters
-        embeddings (:obj:`onmt.modules.Embeddings`):
+        embeddings (onmt.modules.Embeddings):
           embeddings to use, should have positional encodings
+        pos_ffn_activation_fn (ActivationFunction):
+            activation function choice for PositionwiseFeedForward layer
 
     Returns:
-        (`FloatTensor`, `FloatTensor`):
+        (torch.FloatTensor, torch.FloatTensor):
 
-        * embeddings `[src_len x batch_size x model_dim]`
-        * memory_bank `[src_len x batch_size x model_dim]`
+        * enc_out ``(batch_size, src_len, model_dim)``
+        * encoder final state: None in the case of Transformer
+        * src_len ``(batch_size)``
     """
 
-    def __init__(self, num_layers, d_model, heads, d_ff,
-                 dropout, embeddings):
+    def __init__(
+        self,
+        num_layers,
+        d_model,
+        heads,
+        d_ff,
+        dropout,
+        attention_dropout,
+        embeddings,
+        max_relative_positions,
+        relative_positions_buckets,
+        pos_ffn_activation_fn=ActivationFunction.relu,
+        add_qkvbias=False,
+        num_kv=0,
+        add_ffnbias=True,
+        parallel_residual=False,
+        layer_norm="standard",
+        norm_eps=1e-6,
+        use_ckpting=[],
+        parallel_gpu=1,
+    ):
         super(TransformerEncoder, self).__init__()
 
-        self.num_layers = num_layers
         self.embeddings = embeddings
         self.transformer = nn.ModuleList(
-            [TransformerEncoderLayer(d_model, heads, d_ff, dropout)
-             for _ in range(num_layers)])
-        self.layer_norm = nn.LayerNorm(d_model, eps=1e-6)
+            [
+                TransformerEncoderLayer(
+                    d_model,
+                    heads,
+                    d_ff,
+                    dropout,
+                    attention_dropout,
+                    max_relative_positions=max_relative_positions,
+                    relative_positions_buckets=relative_positions_buckets,
+                    pos_ffn_activation_fn=pos_ffn_activation_fn,
+                    add_qkvbias=add_qkvbias,
+                    num_kv=num_kv,
+                    add_ffnbias=add_ffnbias,
+                    parallel_residual=parallel_residual,
+                    layer_norm=layer_norm,
+                    norm_eps=norm_eps,
+                    use_ckpting=use_ckpting,
+                    parallel_gpu=parallel_gpu,
+                )
+                for i in range(num_layers)
+            ]
+        )
+        if layer_norm == "standard":
+            self.layer_norm = nn.LayerNorm(d_model, eps=norm_eps)
+        elif layer_norm == "rms":
+            self.layer_norm = RMSNorm(d_model, eps=norm_eps)
+        else:
+            raise ValueError(f"{layer_norm} layer norm type is not supported")
 
-    def forward(self, src, lengths=None):
-        """ See :obj:`EncoderBase.forward()`"""
-        self._check_args(src, lengths)
+    @classmethod
+    def from_opt(cls, opt, embeddings):
+        """Alternate constructor."""
+        return cls(
+            opt.enc_layers,
+            opt.enc_hid_size,
+            opt.heads,
+            opt.transformer_ff,
+            opt.dropout[0] if type(opt.dropout) is list else opt.dropout,
+            opt.attention_dropout[0]
+            if type(opt.attention_dropout) is list
+            else opt.attention_dropout,
+            embeddings,
+            opt.max_relative_positions,
+            opt.relative_positions_buckets,
+            pos_ffn_activation_fn=opt.pos_ffn_activation_fn,
+            add_qkvbias=opt.add_qkvbias,
+            num_kv=opt.num_kv,
+            add_ffnbias=opt.add_ffnbias,
+            parallel_residual=opt.parallel_residual,
+            layer_norm=opt.layer_norm,
+            norm_eps=opt.norm_eps,
+            use_ckpting=opt.use_ckpting,
+            parallel_gpu=opt.world_size
+            if opt.parallel_mode == "tensor_parallel"
+            else 1,
+        )
 
-        emb = self.embeddings(src)
-
-        out = emb.transpose(0, 1).contiguous()
-        words = src[:, :, 0].transpose(0, 1)
-        w_batch, w_len = words.size()
-        padding_idx = self.embeddings.word_padding_idx
-        mask = words.data.eq(padding_idx).unsqueeze(1) \
-            .expand(w_batch, w_len, w_len)
+    def forward(self, src, src_len=None):
+        """See :func:`EncoderBase.forward()`"""
+        enc_out = self.embeddings(src)
+        mask = sequence_mask(src_len).unsqueeze(1).unsqueeze(1)
+        mask = mask.expand(-1, -1, mask.size(3), -1)
+        # Padding mask is now (batch x 1 x slen x slen)
+        # 1 to be expanded to number of heads in MHA
         # Run the forward pass of every layer of the tranformer.
-        for i in range(self.num_layers):
-            out = self.transformer[i](out, mask)
-        out = self.layer_norm(out)
 
-        return emb, out.transpose(0, 1).contiguous(), lengths
+        for layer in self.transformer:
+            enc_out = layer(enc_out, mask)
+        enc_out = self.layer_norm(enc_out)
+        return enc_out, None, src_len
+
+    def update_dropout(self, dropout, attention_dropout):
+        self.embeddings.update_dropout(dropout)
+        for layer in self.transformer:
+            layer.update_dropout(dropout, attention_dropout)

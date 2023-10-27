@@ -2,180 +2,394 @@
 This includes: LossComputeBase and the standard NMTLossCompute, and
                sharded loss compute stuff.
 """
-from __future__ import division
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
 import onmt
-import onmt.inputters as inputters
 from onmt.modules.sparse_losses import SparsemaxLoss
 from onmt.modules.sparse_activations import LogSparsemax
+from onmt.constants import ModelTask, DefaultTokens
+from onmt.modules.copy_generator import collapse_copy_scores
+from onmt.model_builder import load_test_model
+
+try:
+    import ctranslate2
+except ImportError:
+    pass  # this is tested when importing for loading a LM
 
 
-def build_loss_compute(model, tgt_vocab, opt, train=True):
-    """
-    Returns a LossCompute subclass which wraps around an nn.Module subclass
-    (such as nn.NLLLoss) which defines the loss criterion. The LossCompute
-    object allows this loss to be computed in shards and passes the relevant
-    data to a Statistics object which handles training/validation logging.
-    Currently, the NMTLossCompute class handles all loss computation except
-    for when using a copy mechanism. Despite their name, LossCompute objects
-    do not merely compute the loss but also perform the backward pass inside
-    their sharded_compute_loss method.
-    """
-    device = torch.device("cuda" if onmt.utils.misc.use_gpu(opt) else "cpu")
-
-    padding_idx = tgt_vocab.stoi[inputters.PAD_WORD]
-    if opt.copy_attn:
-        criterion = onmt.modules.CopyGeneratorLoss(
-            len(tgt_vocab), opt.copy_attn_force,
-            unk_index=inputters.UNK, ignore_index=padding_idx
-        )
-    elif opt.label_smoothing > 0 and train:
-        criterion = LabelSmoothingLoss(
-            opt.label_smoothing, len(tgt_vocab), ignore_index=padding_idx
-        )
-    elif isinstance(model.generator[1], LogSparsemax):
-        criterion = SparsemaxLoss(ignore_index=padding_idx, reduction='sum')
-    else:
-        criterion = nn.NLLLoss(ignore_index=padding_idx, reduction='sum')
-
-    # if the loss function operates on vectors of raw logits instead of
-    # probabilities, only the first part of the generator needs to be
-    # passed to the NMTLossCompute. At the moment, the only supported
-    # loss function of this kind is the sparsemax loss.
-    use_raw_logits = isinstance(criterion, SparsemaxLoss)
-    loss_gen = model.generator[0] if use_raw_logits else model.generator
-    if opt.copy_attn:
-        compute = onmt.modules.CopyGeneratorLossCompute(
-            criterion, loss_gen, tgt_vocab, opt.copy_loss_by_seqlength
-        )
-    else:
-        compute = NMTLossCompute(criterion, loss_gen)
-    compute.to(device)
-
-    return compute
-
-
-class LossComputeBase(nn.Module):
+class LossCompute(nn.Module):
     """
     Class for managing efficient loss computation. Handles
-    sharding next step predictions and accumulating multiple
-    loss computations
-
-    Users can implement their own loss computation strategy by making
-    subclass of this one.  Users need to implement the _compute_loss()
-    and make_shard_state() methods.
+    accumulating multiple loss computations.
 
     Args:
+        criterion (:obj:`nn. loss function`) : NLLoss or customed loss
         generator (:obj:`nn.Module`) :
+        copy_attn (bool): whether copy attention mechanism is on/off
+        lambda_coverage: Hyper-param to apply coverage attention if any
+        lambda_align: Hyper-param for alignment loss
+        tgt_shift_index (int): 1 for NMT, 0 for LM
+        vocab: target vocab (for copy attention score calculation)
              module that maps the output of the decoder to a
              distribution over the target vocabulary.
-        tgt_vocab (:obj:`Vocab`) :
-             torchtext vocab object representing the target output
-        normalzation (str): normalize by "sents" or "tokens"
+        lm_generator (:obj:`ctranslate2.Generator`): LM Generator
+        lm_prior_lambda (float): weight of LM model in loss
+        lm_prior_tau (float): scaler for LM loss
     """
 
-    def __init__(self, criterion, generator):
-        super(LossComputeBase, self).__init__()
+    def __init__(
+        self,
+        criterion,
+        generator,
+        copy_attn=False,
+        lambda_coverage=0.0,
+        lambda_align=0.0,
+        tgt_shift_index=1,
+        vocab=None,
+        lm_generator=None,
+        lm_prior_lambda=None,
+        lm_prior_tau=None,
+        lm_prior_model=None,
+    ):
+        super(LossCompute, self).__init__()
         self.criterion = criterion
         self.generator = generator
+        self.lambda_coverage = lambda_coverage
+        self.lambda_align = lambda_align
+        self.tgt_shift_index = tgt_shift_index
+        self.copy_attn = copy_attn
+        self.vocab = vocab  # target vocab for copy_attn need
+        self.lm_generator = lm_generator
+        self.lm_prior_lambda = lm_prior_lambda
+        self.lm_prior_tau = lm_prior_tau
+        self.lm_prior_model = lm_prior_model
+
+    @classmethod
+    def from_opts(cls, opt, model, vocab, train=True):
+        """
+        Returns a subclass which wraps around an nn.Module subclass
+        (such as nn.NLLLoss) which defines the loss criterion. The LossCompute
+        object passes relevant data to a Statistics object which handles
+        training/validation logging.
+        The Criterion and LossCompute options are triggered by opt settings.
+        """
+        device = torch.device("cuda" if onmt.utils.misc.use_gpu(opt) else "cpu")
+
+        padding_idx = vocab[DefaultTokens.PAD]
+        unk_idx = vocab[DefaultTokens.UNK]
+
+        if opt.lambda_coverage != 0:
+            assert opt.coverage_attn, (
+                "--coverage_attn needs to be set in "
+                "order to use --lambda_coverage != 0"
+            )
+
+        tgt_shift_idx = 1 if opt.model_task == ModelTask.SEQ2SEQ else 0
+
+        if opt.copy_attn:
+            criterion = onmt.modules.CopyGeneratorLoss(
+                len(vocab),
+                opt.copy_attn_force,
+                unk_index=unk_idx,
+                ignore_index=padding_idx,
+            )
+        else:
+            if opt.generator_function == "sparsemax":
+                criterion = SparsemaxLoss(ignore_index=padding_idx, reduction="sum")
+            else:
+                criterion = nn.CrossEntropyLoss(
+                    ignore_index=padding_idx,
+                    reduction="sum",
+                    label_smoothing=opt.label_smoothing,
+                )
+
+        lm_prior_lambda = opt.lm_prior_lambda
+        lm_prior_tau = opt.lm_prior_tau
+        if opt.lm_prior_model:
+            if opt.lm_prior_model[-3:] == ".pt":
+                opt.gpu = 0
+                opt.fp32 = False
+                opt.int8 = False
+                _, lm_prior_model, lm_model_opt = load_test_model(
+                    opt, model_path=opt.lm_prior_model
+                )
+                lm_prior_model.to(torch.device("cuda", opt.gpu))
+                lm_prior_model.eval()
+                lm_generator = None
+            else:
+                lm_prior_model = None
+                try:
+                    import ctranslate2
+
+                    lm_generator = ctranslate2.Generator(
+                        opt.lm_prior_model, device="cuda", compute_type="float16"
+                    )
+                except ImportError:
+                    raise ImportError("Could not import ctranslate2")
+        else:
+            lm_generator = None
+            lm_prior_model = None
+
+        compute = cls(
+            criterion,
+            model.generator,
+            copy_attn=opt.copy_attn,
+            lambda_coverage=opt.lambda_coverage,
+            lambda_align=opt.lambda_align,
+            tgt_shift_index=tgt_shift_idx,
+            vocab=vocab,
+            lm_generator=lm_generator,
+            lm_prior_lambda=lm_prior_lambda,
+            lm_prior_tau=lm_prior_tau,
+            lm_prior_model=lm_prior_model,
+        )
+        compute.to(device)
+
+        return compute
 
     @property
     def padding_idx(self):
         return self.criterion.ignore_index
 
-    def _make_shard_state(self, batch, output, range_, attns=None):
-        """
-        Make shard state dictionary for shards() to return iterable
-        shards for efficient loss computation. Subclass must define
-        this method to match its own _compute_loss() interface.
+    def _compute_coverage_loss(self, std_attn, cov_attn, tgt):
+        """compute coverage loss"""
+        zero_attn = torch.zeros(cov_attn.size()[1:], device=cov_attn.device)
+        cov_attn = torch.cat((zero_attn.unsqueeze(0), cov_attn[:-1]), 0)
+        covloss = torch.min(std_attn, cov_attn).sum(dim=-1).view(-1)
+
+        covloss[tgt == self.padding_idx] = 0
+        return covloss.sum()
+
+    def _compute_alignement_loss(self, align_head, ref_align):
+        """Compute loss between 2 partial alignment matrix."""
+        # align_head contains value in [0, 1) presenting attn prob,
+        # 0 was resulted by the context attention src_pad_mask
+        # So, the correspand position in ref_align should also be 0
+        # Therefore, clip align_head to > 1e-18 should be bias free.
+        align_loss = -align_head.clamp(min=1e-18).log().mul(ref_align).sum()
+        align_loss *= self.lambda_align
+        return align_loss
+
+    def _compute_copy_loss(self, batch, output, target, align, attns):
+        """Compute the copy attention loss.
         Args:
-            batch: the current batch.
-            output: the predict output from the model.
-            range_: the range of examples for computing, the whole
-                    batch or a trunc of it?
-            attns: the attns dictionary returned from the model.
-        """
-        return NotImplementedError
-
-    def _compute_loss(self, batch, output, target, **kwargs):
-        """
-        Compute the loss. Subclass must define this method.
-
-        Args:
-
             batch: the current batch.
             output: the predict output from the model.
             target: the validate target to compare output with.
-            **kwargs(optional): additional info for computing loss.
+            align:
+            attns: dictionary of attention distributions
+              `(tgt_len, batch, src_len)`
+        Returns:
+            A tuple with the loss and raw scores.
         """
-        return NotImplementedError
+        scores = self.generator(
+            self._bottle(output), self._bottle(attns["copy"]), batch["src_map"]
+        )
+        loss = self.criterion(scores, align, target).sum()
 
-    def monolithic_compute_loss(self, batch, output, attns):
+        return loss, scores
+
+    def _compute_lm_loss_ct2(self, output, target):
         """
-        Compute the forward loss for the batch.
+        Compute the loss between MT output and LM output
+        https://github.com/cbaziotis/lm-prior-for-nmt/blob/master
+        /fairseq_extension/user/lm_prior/lm_prior.py#L131-L133
+        """
+
+        # rescale with tau (temperature) and apply the log_softmax.
+        scores = self.generator(self._bottle(output)) / self.lm_prior_tau
+        scores = F.log_softmax(scores.to(torch.float32), dim=-1)
+
+        src = target.detach().clone()
+        src[src == self.vocab[DefaultTokens.EOS]] = self.padding_idx
+        src = src[:, :-1, :]
+        src_len = src[:, :, 0].ne(self.padding_idx).sum(1)
+        # ct2 expects src with lengths without padding
+        lm_scores = self.lm_generator.forward_batch(
+            ctranslate2.StorageView.from_array(src[:, :, 0].to(torch.int32)),
+            ctranslate2.StorageView.from_array(src_len.to(torch.int32)),
+            return_log_probs=False,
+        )
+        lm_scores = torch.as_tensor(lm_scores, device=scores.device)
+        # again we use raw probs to rescale with tau and apply log_softmax
+        lm_scores = self._bottle(lm_scores) / self.lm_prior_tau
+        lm_scores = F.log_softmax(lm_scores.to(torch.float32), dim=-1)
+        lm_scores[:, self.vocab[DefaultTokens.UNK]] = -50
+        lm_scores[:, self.vocab[DefaultTokens.EOS]] -= 20
+        # lm_scores are in log space so log_target=True
+        lm_loss = F.kl_div(scores, lm_scores, reduction="none", log_target=True).sum(-1)
+        non_padding = self._bottle(output).ne(self.padding_idx)[:, 0]
+        lm_loss = lm_loss.masked_select(non_padding).sum()
+        lm_loss = lm_loss * (self.lm_prior_tau**2)
+        return lm_loss
+
+    def _compute_lm_loss(self, output, target):
+        """
+        Compute the loss between MT output and LM output
+        https://github.com/cbaziotis/lm-prior-for-nmt/blob/master
+        /fairseq_extension/user/lm_prior/lm_prior.py#L131-L133
+        """
+        # rescale with tau (temperature) and apply the log_softmax.
+        scores = self.generator(self._bottle(output)) / self.lm_prior_tau
+        scores = F.log_softmax(scores.to(torch.float32), dim=-1)
+
+        src = target.detach().clone()
+        src[src == self.vocab[DefaultTokens.EOS]] = self.padding_idx
+        src = src[:, :-1, :]
+        src_len = src[:, :, 0].ne(self.padding_idx).sum(1)
+        # ct2 expects src with lengths without padding
+        lm_outs, _ = self.lm_prior_model(src, None, src_len, with_align=False)
+        lm_scores = (
+            self.lm_prior_model.generator(self._bottle(lm_outs)).detach().clone()
+            / self.lm_prior_tau
+        )
+        # again we use raw probs to rescale with tau and apply log_softmax
+        lm_scores = F.log_softmax(lm_scores.to(torch.float32), dim=-1)
+        lm_scores[:, self.vocab[DefaultTokens.UNK]] = -50
+        lm_scores[:, self.vocab[DefaultTokens.EOS]] -= 20
+        # lm_scores are in log space so log_target=True
+        lm_loss = F.kl_div(scores, lm_scores, reduction="none", log_target=True).sum(-1)
+        non_padding = self._bottle(output).ne(self.padding_idx)[:, 0]
+        lm_loss = lm_loss.masked_select(non_padding).sum()
+        lm_loss = lm_loss * (self.lm_prior_tau**2)
+        return lm_loss
+
+    def _bottle(self, _v):
+        return _v.view(-1, _v.size(2))
+
+    def _unbottle(self, _v, batch_size):
+        return _v.view(-1, batch_size, _v.size(1))
+
+    def ignore_prompt(self, batch):
+        """
+        Mask the prompt in the target side of the batch examples in order
+            to set the loss of the prompt to zero.
+        For finetuning on specific tasks.
+        The end of the prompt must be indicated by `the DefaultTokens.MASK_BEFORE`
+            placeholder.
+        The masks are supposed to be properly handled by the loss criterion
+            (e.g. nn.CrossEntropyLoss ).
 
         Args:
-          batch (batch): batch of labeled examples
-          output (:obj:`FloatTensor`):
-              output of decoder model `[tgt_len x batch x hidden]`
-          attns (dict of :obj:`FloatTensor`) :
-              dictionary of attention distributions
-              `[tgt_len x batch x src_len]`
-        Returns:
-            :obj:`onmt.utils.Statistics`: loss statistics
+            batch: The current batch.
         """
-        range_ = (0, batch.tgt.size(0))
-        shard_state = self._make_shard_state(batch, output, range_, attns)
-        _, batch_stats = self._compute_loss(batch, **shard_state)
+        # Create a mask with zeros at prompt positions and ones at answer postions.
+        mask = batch["src"].squeeze(dim=2) == self.padding_idx
+        mask = torch.cumsum(mask.int(), 1)
+        mask = mask.unsqueeze(-1)
+        # Apply the mask on the target side.
+        batch["tgt"] *= mask.int()
+        # Put the padding token index at the prompt positions.
+        batch["tgt"] += self.padding_idx * (1 - mask.int())
+        return batch
 
-        return batch_stats
-
-    def sharded_compute_loss(self, batch, output, attns,
-                             cur_trunc, trunc_size, shard_size,
-                             normalization):
-        """Compute the forward loss and backpropagate.  Computation is done
-        with shards and optionally truncation for memory efficiency.
-
-        Also supports truncated BPTT for long sequences by taking a
-        range in the decoder output sequence to back propagate in.
-        Range is from `(cur_trunc, cur_trunc + trunc_size)`.
-
-        Note sharding is an exact efficiency trick to relieve memory
-        required for the generation buffers. Truncation is an
-        approximate efficiency trick to relieve the memory required
-        in the RNN buffers.
+    def forward(self, batch, output, attns, trunc_start=0, trunc_size=None):
+        """Compute the forward loss, supports truncated BPTT for long
+        sequences by taking a range in the decoder output sequence to
+        back propagate in.
+        Range is from `(trunc_start, trunc_start + trunc_size)`.
+        Truncation is an approximate efficiency trick to relieve the
+        memory required in the RNN buffers.
 
         Args:
           batch (batch) : batch of labeled examples
           output (:obj:`FloatTensor`) :
-              output of decoder model `[tgt_len x batch x hidden]`
-          attns (dict) : dictionary of attention distributions
-              `[tgt_len x batch x src_len]`
-          cur_trunc (int) : starting position of truncation window
+              output of decoder model ``(batch, tgt_len, hidden)``
+          attns (dict) : dictionary of attention weights
+              ``(batch, tgt_len, src_len)``
+          trunc_start (int) : starting position of truncation window
           trunc_size (int) : length of truncation window
-          shard_size (int) : maximum number of examples in a shard
-          normalization (int) : Loss is divided by this number
 
         Returns:
-            :obj:`onmt.utils.Statistics`: validation loss statistics
-
+            A tuple with the loss and a :obj:`onmt.utils.Statistics` instance.
         """
-        batch_stats = onmt.utils.Statistics()
-        range_ = (cur_trunc, cur_trunc + trunc_size)
-        shard_state = self._make_shard_state(batch, output, range_, attns)
-        for shard in shards(shard_state, shard_size):
-            loss, stats = self._compute_loss(batch, **shard)
-            loss.div(float(normalization)).backward()
-            batch_stats.update(stats)
-        return batch_stats
 
-    def _stats(self, loss, scores, target):
+        if trunc_size is None:
+            trunc_size = batch["tgt"].size(1) - trunc_start
+        # take into account here the tgt_shift_index (0 / 1 = LM/NMT)
+        trunc_range = (trunc_start + self.tgt_shift_index, trunc_start + trunc_size)
+
+        target = batch["tgt"][:, trunc_range[0] : trunc_range[1], :]
+        output = output[:, trunc_start : trunc_range[1], :].contiguous()
+
+        flat_tgt = target[:, :, 0].contiguous().view(-1)
+
+        if self.copy_attn:
+            align = (
+                batch["alignment"][:, trunc_range[0] : trunc_range[1]]
+                .contiguous()
+                .view(-1)
+            )
+            loss, scores = self._compute_copy_loss(
+                batch, output, flat_tgt, align, attns
+            )
+            scores_data = collapse_copy_scores(
+                self._unbottle(scores.clone(), len(batch["srclen"])),
+                batch,
+                self.vocab,
+                None,
+            )
+            scores_data = self._bottle(scores_data)
+            # Correct target copy token instead of <unk>
+            # tgt[i] = align[i] + len(tgt_vocab)
+            # for i such that tgt[i] == 0 and align[i] != 0
+            target_data = flat_tgt.clone()
+            unk = self.criterion.unk_index
+            correct_mask = (target_data == unk) & (align != unk)
+            offset_align = align[correct_mask] + len(self.vocab)
+            target_data[correct_mask] += offset_align
+            scores = scores_data
+            flat_tgt = target_data
+
+        else:
+            scores = self.generator(self._bottle(output))
+            if isinstance(self.criterion, SparsemaxLoss):
+                scores = LogSparsemax(scores.to(torch.float32), dim=-1)
+            loss = self.criterion(scores.to(torch.float32), flat_tgt)
+
+            if self.lambda_align != 0.0:
+                align_head = attns["align"]
+                if align_head.dtype != loss.dtype:  # Fix FP16
+                    align_head = align_head.to(loss.dtype)
+                align_idx = batch["align"]
+                batch_size, pad_tgt_size, _ = batch["tgt"].size()
+                _, pad_src_size, _ = batch["src"].size()
+                align_matrix_size = [batch_size, pad_tgt_size, pad_src_size]
+                ref_align = onmt.utils.make_batch_align_matrix(
+                    align_idx, align_matrix_size, normalize=True
+                )
+                ref_align = ref_align[:, trunc_range[0] : trunc_range[1], :]
+                if ref_align.dtype != loss.dtype:
+                    ref_align = ref_align.to(loss.dtype)
+                align_loss = self._compute_alignement_loss(
+                    align_head=align_head, ref_align=ref_align
+                )
+                loss += align_loss
+
+        if self.lambda_coverage != 0.0:
+            coverage_loss = self._compute_coverage_loss(
+                attns["std"], attns["coverage"], flat_tgt
+            )
+            loss += coverage_loss
+
+        if self.lm_generator is not None:
+            lm_loss = self._compute_lm_loss_ct2(output, batch["tgt"])
+            loss = loss + lm_loss * self.lm_prior_lambda
+
+        if self.lm_prior_model is not None:
+            lm_loss = self._compute_lm_loss(output, batch["tgt"])
+            loss = loss + lm_loss * self.lm_prior_lambda
+
+        n_sents = len(batch["srclen"]) if trunc_start == 0 else 0
+        stats = self._stats(n_sents, loss.sum().item(), scores, flat_tgt)
+
+        return loss, stats
+
+    def _stats(self, bsz, loss, scores, target):
         """
         Args:
-            loss (:obj:`FloatTensor`): the loss computed by the loss criterion.
+            loss (int): the loss computed by the loss criterion.
             scores (:obj:`FloatTensor`): a score for each possible output
             target (:obj:`FloatTensor`): true targets
 
@@ -186,131 +400,13 @@ class LossComputeBase(nn.Module):
         non_padding = target.ne(self.padding_idx)
         num_correct = pred.eq(target).masked_select(non_padding).sum().item()
         num_non_padding = non_padding.sum().item()
-        return onmt.utils.Statistics(loss.item(), num_non_padding, num_correct)
-
-    def _bottle(self, _v):
-        return _v.view(-1, _v.size(2))
-
-    def _unbottle(self, _v, batch_size):
-        return _v.view(-1, batch_size, _v.size(1))
-
-
-class LabelSmoothingLoss(nn.Module):
-    """
-    With label smoothing,
-    KL-divergence between q_{smoothed ground truth prob.}(w)
-    and p_{prob. computed by model}(w) is minimized.
-    """
-    def __init__(self, label_smoothing, tgt_vocab_size, ignore_index=-100):
-        assert 0.0 < label_smoothing <= 1.0
-        self.ignore_index = ignore_index
-        super(LabelSmoothingLoss, self).__init__()
-
-        smoothing_value = label_smoothing / (tgt_vocab_size - 2)
-        one_hot = torch.full((tgt_vocab_size,), smoothing_value)
-        one_hot[self.ignore_index] = 0
-        self.register_buffer('one_hot', one_hot.unsqueeze(0))
-
-        self.confidence = 1.0 - label_smoothing
-
-    def forward(self, output, target):
-        """
-        output (FloatTensor): batch_size x n_classes
-        target (LongTensor): batch_size
-        """
-        model_prob = self.one_hot.repeat(target.size(0), 1)
-        model_prob.scatter_(1, target.unsqueeze(1), self.confidence)
-        model_prob.masked_fill_((target == self.ignore_index).unsqueeze(1), 0)
-
-        return F.kl_div(output, model_prob, reduction='sum')
-
-
-class NMTLossCompute(LossComputeBase):
-    """
-    Standard NMT Loss Computation.
-    """
-
-    def __init__(self, criterion, generator, normalization="sents"):
-        super(NMTLossCompute, self).__init__(criterion, generator)
-
-    def _make_shard_state(self, batch, output, range_, attns=None):
-        return {
-            "output": output,
-            "target": batch.tgt[range_[0] + 1: range_[1]],
-        }
-
-    def _compute_loss(self, batch, output, target):
-        bottled_output = self._bottle(output)
-
-        scores = self.generator(bottled_output)
-        gtruth = target.view(-1)
-
-        loss = self.criterion(scores, gtruth)
-        stats = self._stats(loss.clone(), scores, gtruth)
-
-        return loss, stats
-
-
-def filter_shard_state(state, shard_size=None):
-    for k, v in state.items():
-        if shard_size is None:
-            yield k, v
-
-        if v is not None:
-            v_split = []
-            if isinstance(v, torch.Tensor):
-                for v_chunk in torch.split(v, shard_size):
-                    v_chunk = v_chunk.data.clone()
-                    v_chunk.requires_grad = v.requires_grad
-                    v_split.append(v_chunk)
-            yield k, (v, v_split)
-
-
-def shards(state, shard_size, eval_only=False):
-    """
-    Args:
-        state: A dictionary which corresponds to the output of
-               *LossCompute._make_shard_state(). The values for
-               those keys are Tensor-like or None.
-        shard_size: The maximum size of the shards yielded by the model.
-        eval_only: If True, only yield the state, nothing else.
-              Otherwise, yield shards.
-
-    Yields:
-        Each yielded shard is a dict.
-
-    Side effect:
-        After the last shard, this function does back-propagation.
-    """
-    if eval_only:
-        yield filter_shard_state(state)
-    else:
-        # non_none: the subdict of the state dictionary where the values
-        # are not None.
-        non_none = dict(filter_shard_state(state, shard_size))
-
-        # Now, the iteration:
-        # state is a dictionary of sequences of tensor-like but we
-        # want a sequence of dictionaries of tensors.
-        # First, unzip the dictionary into a sequence of keys and a
-        # sequence of tensor-like sequences.
-        keys, values = zip(*((k, [v_chunk for v_chunk in v_split])
-                             for k, (_, v_split) in non_none.items()))
-
-        # Now, yield a dictionary for each shard. The keys are always
-        # the same. values is a sequence of length #keys where each
-        # element is a sequence of length #shards. We want to iterate
-        # over the shards, not over the keys: therefore, the values need
-        # to be re-zipped by shard and then each shard can be paired
-        # with the keys.
-        for shard_tensors in zip(*values):
-            yield dict(zip(keys, shard_tensors))
-
-        # Assumed backprop'd
-        variables = []
-        for k, (v, v_split) in non_none.items():
-            if isinstance(v, torch.Tensor) and state[k].requires_grad:
-                variables.extend(zip(torch.split(state[k], shard_size),
-                                     [v_chunk.grad for v_chunk in v_split]))
-        inputs, grads = zip(*variables)
-        torch.autograd.backward(inputs, grads)
+        n_batchs = 1 if bsz else 0
+        # in the case criterion reduction is None then we need
+        # to sum the loss of each sentence in the batch
+        return onmt.utils.Statistics(
+            loss=loss,
+            n_batchs=n_batchs,
+            n_sents=bsz,
+            n_words=num_non_padding,
+            n_correct=num_correct,
+        )
