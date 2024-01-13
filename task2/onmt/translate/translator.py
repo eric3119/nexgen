@@ -549,7 +549,7 @@ class Translator(object):
             batch_index = (
                     topk_beam_index
                     + beam_offset[:topk_beam_index.size(0)].unsqueeze(1))
-            select_indices = batch_index.view(-1)
+            select_indices = batch_index.view(-1).to(torch.long)
 
             # Append last prediction.
             alive_seq = torch.cat(
@@ -614,7 +614,7 @@ class Translator(object):
                 non_finished = non_finished.to(topk_ids.device)
                 topk_log_probs = topk_log_probs.index_select(0, non_finished)
                 batch_index = batch_index.index_select(0, non_finished)
-                select_indices = batch_index.view(-1)
+                select_indices = batch_index.view(-1).to(torch.long)
                 alive_seq = predictions.index_select(0, non_finished) \
                     .view(-1, alive_seq.size(-1))
                 if alive_attn is not None:
